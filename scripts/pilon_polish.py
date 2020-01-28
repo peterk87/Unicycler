@@ -23,13 +23,96 @@ not, see <http://www.gnu.org/licenses/>.
 """
 
 import argparse
-import sys
 import os
-import unicycler.unicycler
+import shutil
+import sys
+from pathlib import Path
+
 import unicycler.assembly_graph
 import unicycler.log
 import unicycler.pilon_func
-import unicycler.misc
+import unicycler.unicycler
+from unicycler.blast_func import find_start_gene, CannotFindStart
+from unicycler.misc import int_to_str, float_to_str, print_table, gfa_path
+
+
+def rotate_completed_replicons(graph,
+                               start_genes=None,
+                               start_gene_id=90.0,
+                               start_gene_cov=95.0,
+                               out='.',
+                               makeblastdb_path='makeblastdb',
+                               tblastn_path='tblastn',
+                               keep=1):
+    # get default start_genes.fasta from script root dir
+    if start_genes is None:
+        start_genes = default_start_genes_fasta()
+
+    completed_replicons = graph.completed_circular_replicons()
+    if len(completed_replicons) > 0:
+        unicycler.log.log_section_header('Rotating completed replicons')
+        unicycler.log.log_explanation('Any completed circular contigs (i.e. single contigs which have one '
+                                      'link connecting end to start) can have their start position changed '
+                                      'without altering the sequence. For consistency, Unicycler now '
+                                      'searches for a starting gene (dnaA or repA) in each such contig, and '
+                                      'if one is found, the contig is rotated to start with that gene on '
+                                      'the forward strand.')
+
+        rotation_result_table = [['Segment', 'Length', 'Depth', 'Starting gene', 'Position',
+                                  'Strand', 'Identity', 'Coverage']]
+        blast_dir = os.path.join(out, 'blast')
+        if not os.path.exists(blast_dir):
+            os.makedirs(blast_dir)
+        completed_replicons = sorted(completed_replicons, reverse=True,
+                                     key=lambda x: graph.segments[x].get_length())
+        rotation_count = 0
+        for completed_replicon in completed_replicons:
+            segment = graph.segments[completed_replicon]
+            sequence = segment.forward_sequence
+
+            try:
+                seg_name = str(segment.number)
+            except AttributeError:
+                seg_name = segment.full_name
+
+            unicycler.log.log('Segment ' + seg_name + ':', 2)
+            rotation_result_row = [seg_name, int_to_str(len(sequence)),
+                                   float_to_str(segment.depth, 2) + 'x']
+            try:
+                blast_hit = find_start_gene(sequence, start_genes, start_gene_id,
+                                            start_gene_cov, blast_dir, makeblastdb_path,
+                                            tblastn_path)
+            except CannotFindStart:
+                rotation_result_row += ['none found', '', '', '', '']
+            else:
+                rotation_result_row += [blast_hit.qseqid, int_to_str(blast_hit.start_pos),
+                                        'reverse' if blast_hit.flip else 'forward',
+                                        '%.1f' % blast_hit.pident + '%',
+                                        '%.1f' % blast_hit.query_cov + '%']
+                segment.rotate_sequence(blast_hit.start_pos, blast_hit.flip)
+                rotation_count += 1
+            rotation_result_table.append(rotation_result_row)
+
+        unicycler.log.log('', 2)
+        print_table(rotation_result_table, alignments='RRRLRLRR', indent=0,
+                    sub_colour={'none found': 'red'})
+        if rotation_count and keep > 0:
+            out_dir = Path(out)
+            graph.save_to_gfa(str(out_dir / 'rotated.gfa'), newline=True)
+        if keep < 3 and os.path.exists(blast_dir):
+            shutil.rmtree(blast_dir, ignore_errors=True)
+
+
+def default_start_genes_fasta():
+    out = None
+    path = Path(__file__).resolve().absolute().parent.parent
+    for x in path.rglob('**/start_genes.fasta'):
+        if x:
+            out = x
+            break
+    if out is None:
+        raise FileNotFoundError(f'"start_genes.fasta" not found in {path}')
+    return out
 
 
 def main():
@@ -39,37 +122,40 @@ def main():
     polish_dir = os.getcwd()
 
     graph = unicycler.assembly_graph.AssemblyGraph(args.input, None)
+    if not args.no_polish:
+        args.keep = 1
+        insert_size_1st, insert_size_99th = unicycler.pilon_func.get_insert_size_range(graph, args,
+                                                                                       polish_dir)
+        args.keep = 3
 
-    args.keep = 1
-    insert_size_1st, insert_size_99th = unicycler.pilon_func.get_insert_size_range(graph, args,
-                                                                                   polish_dir)
-    args.keep = 3
-    
-    for i in range(10):
-        if i > 0:
-            graph.rotate_circular_sequences()
+        for i in range(10):
+            if i > 0:
+                graph.rotate_circular_sequences()
 
-        round_num = i + 1
-        change_count = unicycler.pilon_func.polish_with_pilon(graph, args, polish_dir,
-                                                              insert_size_1st, insert_size_99th,
-                                                              round_num, 'all')
-        input_filename = str(round_num) + '_polish_input.fasta'
-        paired_bam_filename = str(round_num) + '_paired_alignments.bam'
-        unpaired_bam_filename = str(round_num) + '_unpaired_alignments.bam'
-        for f in [input_filename,
-                  input_filename + '.1.bt2', input_filename + '.2.bt2',
-                  input_filename + '.3.bt2', input_filename + '.4.bt2',
-                  input_filename + '.rev.1.bt2', input_filename + '.rev.2.bt2',
-                  paired_bam_filename, paired_bam_filename + '.bai',
-                  unpaired_bam_filename, unpaired_bam_filename + '.bai']:
-            try:
-                os.remove(os.path.join(polish_dir, f))
-            except FileNotFoundError:
-                pass
+            round_num = i + 1
+            change_count = unicycler.pilon_func.polish_with_pilon(graph, args, polish_dir,
+                                                                  insert_size_1st, insert_size_99th,
+                                                                  round_num, 'all')
+            input_filename = str(round_num) + '_polish_input.fasta'
+            paired_bam_filename = str(round_num) + '_paired_alignments.bam'
+            unpaired_bam_filename = str(round_num) + '_unpaired_alignments.bam'
+            for f in [input_filename,
+                      input_filename + '.1.bt2', input_filename + '.2.bt2',
+                      input_filename + '.3.bt2', input_filename + '.4.bt2',
+                      input_filename + '.rev.1.bt2', input_filename + '.rev.2.bt2',
+                      paired_bam_filename, paired_bam_filename + '.bai',
+                      unpaired_bam_filename, unpaired_bam_filename + '.bai']:
+                try:
+                    os.remove(os.path.join(polish_dir, f))
+                except FileNotFoundError:
+                    pass
 
-        if not change_count:
-            break
-
+            if not change_count:
+                break
+    else:
+        unicycler.log.log('Skipping Pilon polishing!')
+    if args.do_rotate:
+        rotate_completed_replicons(graph)
     graph.save_to_gfa(args.output + '.gfa')
     graph.save_to_fasta(args.output + '.fasta')
     unicycler.log.log('')
@@ -106,6 +192,8 @@ def get_arguments():
                         help='Path to the java executable')
     parser.add_argument('--samtools_path', type=str, default='samtools',
                         help='Path to the samtools executable')
+    parser.add_argument('--no-polish', action='store_true')
+    parser.add_argument('--do-rotate', action='store_true')
 
     if len(sys.argv) == 1:
         parser.print_help(file=sys.stderr)
@@ -213,8 +301,8 @@ def quit_if_dependency_problem(bowtie2_build_status, bowtie2_status, samtools_st
                                        'using --pilon_path')
     if pilon_status == 'bad':
         unicycler.misc.quit_with_error('Pilon was found (' + args.pilon_path + ') but does not '
-                                       'work - either fix it or specify a different location '
-                                       'using --pilon_path')
+                                                                               'work - either fix it or specify a different location '
+                                                                               'using --pilon_path')
 
     # Code should never get here!
     unicycler.misc.quit_with_error('Unspecified error with dependencies')
